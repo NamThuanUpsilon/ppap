@@ -1,0 +1,913 @@
+name: ERP · CI · Checks · Reusable
+
+# Reusable CI graph: repo gates / lint / typecheck / test and the e2e suite
+# against an arbitrary erp-namthuan ref. Called by both PR-CI
+# (ppap:erp-ci-pr.yml) and the deploy gate (ppap:erp-deploy-reusable.yml).
+# Every suite runs as SHARDS fanned out to idle fleet repos — the checks via
+# erp-ci-checks-batch.yml, e2e via erp-ci-e2e-batch.yml — and this run
+# coordinates. Outputs one verdict per suite so callers can build a per-suite
+# summary.
+
+on:
+  workflow_call:
+    inputs:
+      checkout_ref:
+        description: 'erp-namthuan ref to check out (refs/pull/<N>/merge for PR CI, sha for staging deploy, refs/tags/<tag> for production).'
+        type: string
+        required: true
+      e2e_shards:
+        description: 'DESIRED number of parallel Playwright shards. The effective count is min(this, available capacity) — see the e2e job. 48 = 4 workers x 12 shards at the default WORKER_SLOTS on an idle fleet, more workers with smaller batches on a busy one. Both PR CI and the deploy gate inherit it.'
+        type: number
+        default: 48
+      fleet:
+        description: 'Comma-separated owner/repo list of ppap CI repos this run may borrow idle capacity from, for the check shards and the e2e shards alike (the erp-namthuan variable PPAP_CI_REPOS). Empty ⇒ scripts/ci/fanout.mjs reads PPAP_CI_REPOS from erp-namthuan itself; only an unreadable variable keeps every shard on this repo.'
+        type: string
+        default: ''
+      pr_number:
+        description: 'Source PR number, forwarded to check and e2e batches so they can detect a moved head and bail early.'
+        type: string
+        default: ''
+      head_sha:
+        description: 'Head SHA under test, forwarded to check and e2e batches for the same stale check.'
+        type: string
+        default: ''
+      run_e2e:
+        description: 'Whether to run the e2e matrix. PR CI keeps the default (true); the deploy gate passes false so staging/production builds are not blocked on dashboard e2e.'
+        type: boolean
+        default: true
+      gates_shards:
+        description: 'Shards for the repo gates (scripts/ci/checks/plan.mjs GATES). Capped at the gate count. Neither caller passes it, so PR CI and the deploy gate run the same split.'
+        type: number
+        default: 2
+      lint_shards:
+        description: 'Shards for ESLint (root config split by workspace directory, plus each workspace lint:js). Capped at the unit count.'
+        type: number
+        default: 2
+      typecheck_shards:
+        description: 'Shards for typecheck (one unit per workspace package with a typecheck script). Capped at the package count.'
+        type: number
+        default: 4
+      test_shards:
+        description: 'Shards for Vitest (one unit per workspace package with a test script). Capped at the package count.'
+        type: number
+        default: 6
+      e2e_changed_only:
+        description: 'Scope e2e to the changed service''s specs (broad/shared change → full suite, nothing relevant → skip). NOBODY passes true any more: PR CI stopped scoping in #3722 because a PR could be green while the suite was red, and the deploy gate always ran full. Kept because the scoping logic below is still the right tool if a caller ever needs it. See scripts/ci/e2e/plan.sh.'
+        type: boolean
+        default: false
+    outputs:
+      # The four check verdicts keep the names (and meaning) they had as
+      # separate jobs, so erp-ci-pr.yml and erp-deploy-reusable.yml read them
+      # unchanged. `biome` is the repo-gates suite — the key stayed when the job
+      # was renamed, and callers read it as R_BIOME. Each is `success` only when
+      # every shard of that suite passed; anything else, empty included, is red.
+      biome:
+        description: 'Verdict of the sharded repo-gates suite.'
+        value: ${{ jobs.checks.outputs.gates }}
+      typecheck:
+        description: 'Verdict of the sharded typecheck suite.'
+        value: ${{ jobs.checks.outputs.typecheck }}
+      lint:
+        description: 'Verdict of the sharded ESLint suite.'
+        value: ${{ jobs.checks.outputs.lint }}
+      test:
+        description: 'Verdict of the sharded Vitest suite.'
+        value: ${{ jobs.checks.outputs.test }}
+      check_runs:
+        description: 'JSON array of the fanned-out check batch runs ([{repo, batch, run_id, conclusion}]), the checks counterpart of e2e_runs.'
+        value: ${{ jobs.checks.outputs.runs }}
+      e2e:
+        description: 'e2e verdict: success when every batch passed OR the plan had nothing relevant to test; failure otherwise. Empty (⇒ red) if the job itself died.'
+        value: ${{ jobs.e2e.outputs.result }}
+      e2e_runs:
+        description: 'JSON array of the fanned-out batch runs ([{repo, batch, run_id, conclusion}]) so the caller can scan their logs. Empty when nothing was dispatched.'
+        value: ${{ jobs.e2e.outputs.runs }}
+    secrets:
+      # The multi-account PAT pool — the ONLY token source. Required: the
+      # single-PAT fallback was retired once the pool was live in all 8 stores,
+      # because a fallback meant a mis-set pool silently reverted the whole
+      # system to one account's quota and looked healthy doing it.
+      PAT_TOKEN_POOL:
+        required: true
+
+permissions: read-all
+
+env:
+  PRIVATE_REPO: NamThuanVn/erp-namthuan
+  # Pre-seed init.defaultBranch so actions/checkout's internal `git init` stops
+  # printing the "hint: git config --global init.defaultBranch <name>" line on
+  # every job. git reads these GIT_CONFIG_* env vars as extra config, so the
+  # hint's precondition (unset init.defaultBranch) is never met. Cosmetic
+  # CI-log-noise removal only.
+  GIT_CONFIG_COUNT: "1"
+  GIT_CONFIG_KEY_0: init.defaultBranch
+  GIT_CONFIG_VALUE_0: main
+
+jobs:
+  # ONE job for the repo gates, ESLint, typecheck and Vitest: plan their shards,
+  # dispatch them to idle fleet repos, wait, and emit one verdict per suite.
+  #
+  # These were four fixed jobs here — Repo gates, Lint, and two 3-leg matrices
+  # whose legs were hand-binned package lists — holding 8 of this org's 20
+  # concurrent-job slots next to the 10 zone builds on the e2e critical path.
+  # Now scripts/ci/checks/plan.mjs discovers each suite's units (packages,
+  # gates, ESLint directories), bin-packs them by measured weight into
+  # `<suite>_shards` shards, and scripts/ci/fanout.mjs (SUITE=checks) sends them
+  # to erp-ci-checks-batch.yml on whichever fleet repos have room — the same
+  # recruitment the e2e shards use. Widening a suite is changing its input.
+  #
+  # Starts at t=0 with no `needs:`: a checks batch needs no build artifact, so
+  # it runs alongside the zone builds and is usually done before e2e starts.
+  # The e2e dispatch that follows sees the check batches in each host's
+  # in-flight job count, so the two never over-commit a host.
+  #
+  # FAILS CLOSED per suite: an output is `success` only when every unit of
+  # that suite reported a green job (scripts/ci/lib/fanout-plan.mjs
+  # suiteVerdicts). A dispatch failure, a timeout or a missing job is red.
+  checks:
+    name: 1 · CI · Checks
+    runs-on: ubuntu-latest
+    # Bounded by the slowest remote unit (20 min) plus queueing on a busy host.
+    timeout-minutes: 45
+    outputs:
+      gates: ${{ steps.verdict.outputs.gates }}
+      lint: ${{ steps.verdict.outputs.lint }}
+      typecheck: ${{ steps.verdict.outputs.typecheck }}
+      test: ${{ steps.verdict.outputs.test }}
+      runs: ${{ steps.collect.outputs.runs }}
+    steps:
+      # PAT pool: pick whichever pooled account still has REST quota. ONE account's
+      # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
+      # deploy graph AND the PR CI dispatcher — when it ran dry, even human PR CI
+      # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
+      # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
+      # probing every token is free. Inlined rather than calling
+      # `scripts/ci/ppap/pat-pool.sh` (the canonical copy — keep the two in step)
+      # because a private-repo checkout itself needs a token, so the pool cannot live
+      # behind it.
+      #
+      # PAT_TOKEN_POOL is the ONLY source — the single-PAT fallback was retired once
+      # the pool was live in all 8 stores (#2611 shipped it, this removed it). That is
+      # deliberate: a fallback meant a mis-set pool silently reverted the whole system
+      # to one account's quota, i.e. straight back to the outage above, looking healthy
+      # the entire time. Now a missing pool fails the job loudly instead.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+          # account reads 5000 — so one account served every job while the rest idled,
+          # which is the concentration the pool exists to prevent. Jobs shuffle
+          # independently, so a fan-out spreads instead of stampeding onto one token.
+          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ env.RESOLVED_PAT }}
+          ref: ${{ inputs.checkout_ref }}
+          persist-credentials: false
+
+      - name: Plan check shards
+        id: plan
+        env:
+          GATES_SHARDS: ${{ inputs.gates_shards }}
+          LINT_SHARDS: ${{ inputs.lint_shards }}
+          TYPECHECK_SHARDS: ${{ inputs.typecheck_shards }}
+          TEST_SHARDS: ${{ inputs.test_shards }}
+        run: |
+          set -euo pipefail
+          if [ ! -f scripts/ci/checks/plan.mjs ]; then
+            echo "::error::scripts/ci/checks/plan.mjs is missing on this ref — rebase the PR onto main."
+            exit 1
+          fi
+          UNITS="$(node scripts/ci/checks/plan.mjs units \
+            "gates=$GATES_SHARDS" "lint=$LINT_SHARDS" \
+            "typecheck=$TYPECHECK_SHARDS" "test=$TEST_SHARDS")"
+          echo "units=$UNITS" >> "$GITHUB_OUTPUT"
+          echo "▶ check units: $UNITS" >&2
+
+      - name: Dispatch check batches
+        id: dispatch
+        env:
+          # A pooled PAT, not GITHUB_TOKEN: the probe and the dispatch both cross
+          # org boundaries, and events created with GITHUB_TOKEN do not trigger
+          # workflows at all.
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          # The whole pool, so fanout.mjs can move a dispatch refused by GitHub's
+          # per-account secondary rate limit to another account.
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          SUITE: checks
+          CHECK_UNITS: ${{ steps.plan.outputs.units }}
+          SELF: ${{ github.repository }}
+          FLEET: ${{ inputs.fleet }}
+          CHECKOUT_REF: ${{ inputs.checkout_ref }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          CORRELATION: ${{ github.run_id }}-${{ github.run_attempt }}
+          COORD_FALLBACK_SLOTS: '14'
+          # Per-host cap. 14 default units over 8 lands on two hosts, leaving
+          # the rest of the fleet to the e2e shards that dispatch minutes later.
+          WORKER_SLOTS: '8'
+        run: node scripts/ci/fanout.mjs dispatch
+
+      # Uploaded BEFORE collect as well as after it: scripts/ci/progress.mjs
+      # reads this map while the run is still going, to find the batch runs
+      # whose failures it publishes early. After collect it also carries each
+      # batch's run id, for scripts/ci/ppap/ci-repo.sh --fanout.
+      - name: Upload check fan-out map (dispatched)
+        if: ${{ steps.dispatch.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-fanout-checks
+          path: ci-fanout-checks.json
+          retention-days: 7
+          overwrite: true
+          if-no-files-found: ignore
+
+      - name: Wait for check batches
+        id: collect
+        if: ${{ steps.dispatch.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          SUITE: checks
+          FANOUT: ${{ steps.dispatch.outputs.fanout }}
+          TIMEOUT_S: '2400'
+        run: node scripts/ci/fanout.mjs collect
+
+      - name: Upload check fan-out map (resolved)
+        if: ${{ always() && steps.dispatch.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-fanout-checks
+          path: ci-fanout-checks.json
+          retention-days: 7
+          overwrite: true
+          if-no-files-found: ignore
+
+      - name: Emit per-suite verdicts
+        id: verdict
+        if: ${{ always() }}
+        env:
+          R_GATES: ${{ steps.collect.outputs.result_gates }}
+          R_LINT: ${{ steps.collect.outputs.result_lint }}
+          R_TYPECHECK: ${{ steps.collect.outputs.result_typecheck }}
+          R_TEST: ${{ steps.collect.outputs.result_test }}
+        run: |
+          set -euo pipefail
+          # Anything but a literal `success` is red — including an empty value
+          # from a dispatch that failed or a collect that never ran.
+          for s in gates lint typecheck test; do
+            var="R_$(printf '%s' "$s" | tr '[:lower:]' '[:upper:]')"
+            v="${!var:-}"
+            [ "$v" = success ] || v=failure
+            echo "$s=$v" >> "$GITHUB_OUTPUT"
+            echo "▶ $s: $v" >&2
+          done
+
+  # Plan the e2e run. Two responsibilities:
+  #   1. Decide SCOPE — when e2e_changed_only is true (PR CI), diff the PR
+  #      (HEAD^1..HEAD on refs/pull/N/merge) through scripts/ci/e2e/plan.sh:
+  #      full | scoped <specs> | skip. Otherwise (deploy gate) → full.
+  #   2. Fan the effective shard count into a JSON array (`[1,2,...,N]`) for the
+  #      matrix via fromJSON — full → e2e_shards shards; scoped → 1 shard (a
+  #      handful of specs doesn't need 12 stacks); skip → empty (matrix no-op).
+  # Pure git + jq + bash (no pnpm install). `run` is 'true' unless mode==skip.
+  e2e-plan:
+    name: 1 · CI · E2E (plan)
+    if: ${{ inputs.run_e2e }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.plan.outputs.run }}
+      mode: ${{ steps.plan.outputs.mode }}
+      targets: ${{ steps.plan.outputs.targets }}
+      shards: ${{ steps.plan.outputs.shards }}
+      total: ${{ steps.plan.outputs.total }}
+      # The zone build matrix, DISCOVERED rather than hardcoded — see the
+      # `zones` step below and scripts/ci/e2e/zones.mjs.
+      zones: ${{ steps.zones.outputs.matrix }}
+    steps:
+      # PAT pool: pick whichever pooled account still has REST quota. ONE account's
+      # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
+      # deploy graph AND the PR CI dispatcher — when it ran dry, even human PR CI
+      # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
+      # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
+      # probing every token is free. Inlined rather than calling
+      # `scripts/ci/ppap/pat-pool.sh` (the canonical copy — keep the two in step)
+      # because a private-repo checkout itself needs a token, so the pool cannot live
+      # behind it.
+      #
+      # PAT_TOKEN_POOL is the ONLY source — the single-PAT fallback was retired once
+      # the pool was live in all 8 stores (#2611 shipped it, this removed it). That is
+      # deliberate: a fallback meant a mis-set pool silently reverted the whole system
+      # to one account's quota, i.e. straight back to the outage above, looking healthy
+      # the entire time. Now a missing pool fails the job loudly instead.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+          # account reads 5000 — so one account served every job while the rest idled,
+          # which is the concentration the pool exists to prevent. Jobs shuffle
+          # independently, so a fan-out spreads instead of stampeding onto one token.
+          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ env.RESOLVED_PAT }}
+          ref: ${{ inputs.checkout_ref }}
+          # Full history so HEAD^1 (the PR's base parent on the merge ref) is
+          # available for the diff.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - id: plan
+        env:
+          CHANGED_ONLY: ${{ inputs.e2e_changed_only }}
+          TOTAL: ${{ inputs.e2e_shards }}
+        run: |
+          set -euo pipefail
+          MODE=full
+          TARGETS=""
+          if [ "$CHANGED_ONLY" = "true" ]; then
+            # HEAD^1 on refs/pull/N/merge = the base (main); the diff to HEAD is
+            # exactly the PR's delta.
+            DECISION="$(E2E_PLAN_BASE=HEAD^1 bash scripts/ci/e2e/plan.sh)"
+            MODE="${DECISION%% *}"
+            TARGETS="${DECISION#"$MODE"}"; TARGETS="${TARGETS# }"
+          fi
+          case "$MODE" in
+            skip)
+              echo "run=false"  >> "$GITHUB_OUTPUT"
+              echo "shards=[]"  >> "$GITHUB_OUTPUT"
+              echo "total=0"    >> "$GITHUB_OUTPUT" ;;
+            scoped)
+              # A scoped run USED to be pinned to exactly one shard, on the
+              # assumption that "a handful of specs doesn't need 12 stacks".
+              # That assumption does not hold: scripts/ci/e2e/plan.sh emits spec
+              # DIRECTORIES as well as files, and the directories are uneven.
+              # It used to be far worse — `sourcing` mapped to a single
+              # 232-spec `scpms` folder shared by four zones — but even now
+              # apps/procurement/e2e is ~99 specs against apps/mail/e2e's 1,
+              # and the big ones ran serially in ONE job, so the most common
+              # kind of PR in this repo got the slowest possible e2e.
+              #
+              # Size the matrix to the number of specs actually selected, at
+              # the same ~25-specs-per-shard density the full run uses (467
+              # specs / 18 shards). Capped at 8 so a scoped run still leaves
+              # room in the org's 20-job budget for the rest of the graph.
+              SPEC_COUNT=0
+              for t in $TARGETS; do
+                if [ -d "$t" ]; then
+                  n=$(find "$t" -name '*.spec.ts' -type f | wc -l)
+                else
+                  n=1
+                fi
+                SPEC_COUNT=$(( SPEC_COUNT + n ))
+              done
+              N=$(( (SPEC_COUNT + 24) / 25 ))
+              [ "$N" -lt 1 ] && N=1
+              [ "$N" -gt 8 ] && N=8
+              SHARDS=$(seq 1 "$N" | jq -R 'tonumber' | jq -cs '.')
+              echo "run=true"      >> "$GITHUB_OUTPUT"
+              echo "shards=$SHARDS" >> "$GITHUB_OUTPUT"
+              echo "total=$N"       >> "$GITHUB_OUTPUT"
+              echo "▶ scoped: $SPEC_COUNT spec files → $N shard(s)" >&2 ;;
+            *)
+              SHARDS=$(seq 1 "$TOTAL" | jq -R 'tonumber' | jq -cs '.')
+              echo "run=true"       >> "$GITHUB_OUTPUT"
+              echo "shards=$SHARDS"  >> "$GITHUB_OUTPUT"
+              echo "total=$TOTAL"    >> "$GITHUB_OUTPUT" ;;
+          esac
+          echo "mode=$MODE"       >> "$GITHUB_OUTPUT"
+          echo "targets=$TARGETS" >> "$GITHUB_OUTPUT"
+          echo "▶ e2e plan: mode=$MODE targets=[$TARGETS]" >&2
+
+      # Which zones to build, DISCOVERED from apps/*/wrangler.jsonc — the same
+      # scan serve-parity.sh and ci-boot.sh use to decide which zones to BOOT.
+      #
+      # This used to be a hardcoded matrix below, and the two drifted the moment
+      # a zone was added: apps/mail was booted but never built, so under BUILD=0
+      # it crashed and took the whole stack down — every shard red. Worse, the
+      # fix could not reach the PR that caused it, because this file only
+      # arrives in the satellite repos on a push to main. Deriving it means
+      # adding a zone needs no workflow edit at all.
+      - id: zones
+        run: |
+          set -euo pipefail
+          MATRIX="$(node scripts/ci/e2e/zones.mjs)"
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "▶ e2e zones: $(node scripts/ci/e2e/zones.mjs --names | tr '\n' ' ')" >&2
+
+  # Build each dashboard zone on its OWN runner, in parallel. The 6 OpenNext
+  # zones are fully independent (no cross-zone deps; dashboard-shell exports raw
+  # `src/` so there's no prebuild step), so a per-zone matrix turns the old
+  # ~258s serial "build all 6 on one 2-core runner" step into ~6 concurrent
+  # ~60–90s builds — the dominant PR-CI / deploy-gate cost. Each leg tars its own
+  # `apps/<zone>/.open-next` and uploads it; the shards download every zone tar
+  # and reassemble the tree. `fail-fast: false` so one zone's build failure
+  # doesn't mask the others. Free on public-repo minutes — fan out wide.
+  e2e-build-zones:
+    name: 1 · CI · E2E (build ${{ matrix.zone.name }})
+    needs: e2e-plan
+    # Skipped when the plan says nothing e2e-relevant changed. A scoped run still
+    # builds ALL zones — the e2e stack boots the whole multi-zone router.
+    if: ${{ inputs.run_e2e && needs.e2e-plan.outputs.run == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # DERIVED from apps/*/wrangler.jsonc by scripts/ci/e2e/zones.mjs — the
+        # same discovery serve-parity.sh and ci-boot.sh use to decide which
+        # zones to BOOT. Never hardcode this list again: a zone booted but not
+        # built crashes the whole e2e stack, and the fix cannot reach the PR
+        # that introduced it. scripts/gate/ci/zone-matrix.mjs keeps it derived.
+        zone: ${{ fromJSON(needs.e2e-plan.outputs.zones) }}
+    steps:
+      # PAT pool: pick whichever pooled account still has REST quota. ONE account's
+      # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
+      # deploy graph AND the PR CI dispatcher — when it ran dry, even human PR CI
+      # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
+      # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
+      # probing every token is free. Inlined rather than calling
+      # `scripts/ci/ppap/pat-pool.sh` (the canonical copy — keep the two in step)
+      # because a private-repo checkout itself needs a token, so the pool cannot live
+      # behind it.
+      #
+      # PAT_TOKEN_POOL is the ONLY source — the single-PAT fallback was retired once
+      # the pool was live in all 8 stores (#2611 shipped it, this removed it). That is
+      # deliberate: a fallback meant a mis-set pool silently reverted the whole system
+      # to one account's quota, i.e. straight back to the outage above, looking healthy
+      # the entire time. Now a missing pool fails the job loudly instead.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+          # account reads 5000 — so one account served every job while the rest idled,
+          # which is the concentration the pool exists to prevent. Jobs shuffle
+          # independently, so a fan-out spreads instead of stampeding onto one token.
+          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ env.RESOLVED_PAT }}
+          ref: ${{ inputs.checkout_ref }}
+          persist-credentials: false
+
+      # OUTPUT cache — the packaged bundle itself, not just the compiler cache.
+      # On a hit this job does checkout → restore → upload (~10s) and skips
+      # install AND the build entirely; the ~103–166s build is the single
+      # largest item on the e2e critical path, so this is the cheapest minute
+      # in the graph to buy back.
+      #
+      # The key must name EVERYTHING that can change the emitted bundle, and
+      # nothing that can't — a false hit ships a stale bundle into e2e, which
+      # is far worse than a miss. A zone depends on its own source, the shared
+      # packages it transpiles (`transpilePackages: api-types, utils,
+      # dashboard-shell` — see apps/<zone>/next.config.ts) and the root
+      # compile/dependency config. Zones are mutually independent (no
+      # cross-zone imports; they share code only through packages/*), which is
+      # what makes the PER-ZONE scope sound — and it matters: keying on the
+      # whole of `apps/**` busts all ten zones whenever any one app changes,
+      # i.e. on almost every PR. Scoped this way, a PR touching apps/quotation
+      # rebuilds quotation and restores the other nine.
+      #
+      # The package side is scoped for the same reason, and it was NOT: the key
+      # hashed all of `packages/**`, so editing one busted all eleven zones even
+      # when no bundle could contain it. packages/e2e-kit is Playwright helper
+      # code that only specs import, and touching it rebuilt every zone — ~25
+      # runner-minutes and ~3.5 wall-clock minutes for a change that cannot alter
+      # an emitted byte. The three named below are the real closure: a zone's
+      # source imports api-types, utils and dashboard-shell, and of those only
+      # utils and dashboard-shell have workspace dependencies of their own (both
+      # on api-types).
+      #
+      # That closure is computed from source and compared with this key by
+      # scripts/gate/ci/zone-cache-key.mjs, on every commit and in CI, because
+      # the failure it prevents is invisible: a zone importing a fourth package
+      # would keep hitting this cache, and e2e would test source the key never
+      # saw. Add the package here AND let that gate confirm it.
+      #
+      # The three non-package entries are the App Shell's CSS coupling: the
+      # shell's stylesheet `@source`s every zone's route tree, and a zone remote
+      # (scripts/ci/remote/build.mjs) ships only the utilities that scan missed —
+      # so any zone's `src/app`, the shell's styles, or the remote builder can
+      # change another zone's emitted CSS.
+      - name: Cache zone bundle
+        id: zonetar
+        uses: actions/cache@v6
+        with:
+          path: zone-${{ matrix.zone.name }}.tar
+          key: zonetar-v2-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'tsconfig.base.json', '.github/actions/install/action.yml', format('apps/{0}/**', matrix.zone.name), 'apps/*/src/app/**', 'apps/shell/src/styles/**', 'scripts/ci/remote/**', 'packages/api-types/**', 'packages/utils/**', 'packages/dashboard-shell/**') }}
+          # No restore-keys ON PURPOSE: a partial-match restore would hand back
+          # a bundle built from different source. Exact key or rebuild.
+
+      - uses: ./.github/actions/install
+        if: steps.zonetar.outputs.cache-hit != 'true'
+
+      # Warm THIS zone's Next compiler cache across runs. build:pages still runs
+      # (so it always re-evaluates source — no stale-build risk) but reuses prior
+      # compilation work, cutting a cold ~60–120s build to ~20–40s on unchanged
+      # source. Keyed per-zone so the matrix legs don't clobber one another's
+      # cache. Scoped to this zone's own inputs for the same reason as the
+      # bundle cache above — an `apps/**` key made every zone miss on any app
+      # change. Unlike the bundle cache this one KEEPS restore-keys: a stale
+      # compiler cache is only a slower build, never a wrong one.
+      - name: Cache Next build
+        if: steps.zonetar.outputs.cache-hit != 'true'
+        uses: actions/cache@v6
+        with:
+          path: apps/${{ matrix.zone.name }}/.next/cache
+          key: next-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles(format('apps/{0}/**', matrix.zone.name), 'packages/api-types/**', 'packages/utils/**', 'packages/dashboard-shell/**') }}
+          restore-keys: |
+            next-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml') }}-
+            next-${{ runner.os }}-${{ matrix.zone.name }}-
+
+      # Generic relative `/api` build — no host/port baked, so the same bundle
+      # boots on every shard's free port.
+      - name: Build zone (OpenNext shell / zone remote)
+        if: steps.zonetar.outputs.cache-hit != 'true'
+        run: pnpm --filter ${{ matrix.zone.pkg }} run build:pages
+
+      # tar (not a raw many-small-files upload) so the file count doesn't make
+      # upload/download slow. The bundle is already minified, so skip artifact
+      # gzip. tar preserves the `apps/<zone>/.open-next` (shell) or
+      # `apps/<zone>/.remote` (zone remote) path so the shard reassembles the
+      # tree verbatim by untarring every zone tar.
+      - name: Package zone build
+        if: steps.zonetar.outputs.cache-hit != 'true'
+        run: |
+          app=apps/${{ matrix.zone.name }}
+          if [ -d "$app/.open-next" ]; then out="$app/.open-next"; else out="$app/.remote"; fi
+          tar -cf zone-${{ matrix.zone.name }}.tar "$out"
+
+      # Runs on hit AND miss — on a hit the tar came from the cache, on a miss
+      # from the step above. Either way the shards' `pattern: e2e-*` download
+      # must find it.
+      - name: Upload zone build
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-zone-${{ matrix.zone.name }}
+          path: zone-${{ matrix.zone.name }}.tar
+          retention-days: 1
+          compression-level: 0
+
+  # Seed the isolated e2e DB ONCE, in parallel with the zone builds (it only
+  # needs the per-service migration scripts, not the dashboard build output).
+  # Isolated-state branch of scripts/dev/db/reset.sh: per-service `wrangler d1 migrations
+  # apply --persist-to .wrangler/state-e2e`, no ExMS demo seed — exactly the DB
+  # each shard would have produced itself. Each shard is a separate runner, so
+  # its untarred copy of the state dir is its own mutable DB — shard isolation
+  # is preserved without snapshotting.
+  e2e-seed:
+    name: 1 · CI · E2E (seed db)
+    needs: e2e-plan
+    if: ${{ inputs.run_e2e && needs.e2e-plan.outputs.run == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # PAT pool: pick whichever pooled account still has REST quota. ONE account's
+      # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
+      # deploy graph AND the PR CI dispatcher — when it ran dry, even human PR CI
+      # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
+      # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
+      # probing every token is free. Inlined rather than calling
+      # `scripts/ci/ppap/pat-pool.sh` (the canonical copy — keep the two in step)
+      # because a private-repo checkout itself needs a token, so the pool cannot live
+      # behind it.
+      #
+      # PAT_TOKEN_POOL is the ONLY source — the single-PAT fallback was retired once
+      # the pool was live in all 8 stores (#2611 shipped it, this removed it). That is
+      # deliberate: a fallback meant a mis-set pool silently reverted the whole system
+      # to one account's quota, i.e. straight back to the outage above, looking healthy
+      # the entire time. Now a missing pool fails the job loudly instead.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+          # account reads 5000 — so one account served every job while the rest idled,
+          # which is the concentration the pool exists to prevent. Jobs shuffle
+          # independently, so a fan-out spreads instead of stampeding onto one token.
+          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ env.RESOLVED_PAT }}
+          ref: ${{ inputs.checkout_ref }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/install
+
+      - name: Seed e2e database (once)
+        env:
+          # scripts/dev/db/reset.sh restores the pre-migrated D1 snapshot, which lives on a
+          # release in the PRIVATE repo (it contains real seeded employee/budget
+          # data and must not be public). Without a token `gh` cannot read it and
+          # this job silently falls back to a full cold migration run — correct,
+          # just slower — so the seed step would quietly lose its speedup.
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: STATE_DIR=.wrangler/state-e2e bash scripts/dev/db/reset.sh
+
+      # Mostly-incompressible sqlite — skip artifact gzip.
+      - name: Package seed
+        run: tar -cf e2e-seed.tar .wrangler/state-e2e
+
+      - name: Upload e2e seed
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-seed
+          path: e2e-seed.tar
+          retention-days: 1
+          compression-level: 0
+  # ONE job for the whole e2e stage: work out where the shards go, dispatch
+  # them, wait for them, and emit the single verdict the caller reads.
+  #
+  # This used to be three jobs (fan-out → collect → result). They were always
+  # sequential and always all-or-nothing, so the split bought nothing but three
+  # nodes in the run graph and two sets of job plumbing. The `result` job
+  # existed only because a workflow output must be produced even when the stage
+  # is skipped — handled here by `if: always()` plus an explicit precondition
+  # gate, which is also the one place that has to get "did the stage actually
+  # run?" right.
+  #
+  # FAILS CLOSED by construction: `result` is the workflow's `e2e` output and
+  # the caller treats anything other than the literal `success` as red, so a
+  # crashed job (empty output) is a red run, never a silent pass.
+  e2e:
+    name: 1 · CI · E2E
+    needs: [e2e-plan, e2e-build-zones, e2e-seed]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    # Bounded by the slowest remote shard; the batch jobs cap at 30 min each.
+    timeout-minutes: 60
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+      runs: ${{ steps.collect.outputs.runs }}
+    steps:
+      # PAT pool: pick whichever pooled account still has REST quota. ONE account's
+      # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
+      # deploy graph AND the PR CI dispatcher — when it ran dry, even human PR CI
+      # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
+      # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
+      # probing every token is free. Inlined rather than calling
+      # `scripts/ci/ppap/pat-pool.sh` (the canonical copy — keep the two in step)
+      # because a private-repo checkout itself needs a token, so the pool cannot live
+      # behind it.
+      #
+      # PAT_TOKEN_POOL is the ONLY source — the single-PAT fallback was retired once
+      # the pool was live in all 8 stores (#2611 shipped it, this removed it). That is
+      # deliberate: a fallback meant a mis-set pool silently reverted the whole system
+      # to one account's quota, i.e. straight back to the outage above, looking healthy
+      # the entire time. Now a missing pool fails the job loudly instead.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+          # account reads 5000 — so one account served every job while the rest idled,
+          # which is the concentration the pool exists to prevent. Jobs shuffle
+          # independently, so a fan-out spreads instead of stampeding onto one token.
+          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
+      # The whole "should this stage run, and did its inputs survive?" decision
+      # in one place. Previously spread across three `if:` expressions and the
+      # aggregate's shell.
+      - name: Resolve stage preconditions
+        id: gate
+        env:
+          RUN_E2E: ${{ inputs.run_e2e }}
+          PLAN_RESULT: ${{ needs.e2e-plan.result }}
+          PLAN_RUN: ${{ needs.e2e-plan.outputs.run }}
+          BUILD_RESULT: ${{ needs.e2e-build-zones.result }}
+          SEED_RESULT: ${{ needs.e2e-seed.result }}
+        run: |
+          set -euo pipefail
+          PROCEED=false
+          RESULT=failure
+          if [ "$RUN_E2E" != "true" ]; then
+            # e2e disabled for this caller (the staging deploy gate).
+            RESULT=skipped
+          elif [ "$PLAN_RESULT" != "success" ]; then
+            echo "::error::e2e-plan did not succeed ($PLAN_RESULT) — cannot tell which specs to run."
+          elif [ "$PLAN_RUN" != "true" ]; then
+            # Change-scoped plan found nothing e2e-relevant.
+            RESULT=success
+          elif [ "$BUILD_RESULT" != "success" ] || [ "$SEED_RESULT" != "success" ]; then
+            echo "::error::zone builds ($BUILD_RESULT) or seed ($SEED_RESULT) failed — no artifacts to test against."
+          else
+            PROCEED=true
+          fi
+          {
+            echo "proceed=$PROCEED"
+            echo "result=$RESULT"
+          } >> "$GITHUB_OUTPUT"
+          echo "▶ e2e gate: run_e2e=$RUN_E2E plan=$PLAN_RESULT/$PLAN_RUN build=$BUILD_RESULT seed=$SEED_RESULT → proceed=$PROCEED" >&2
+
+      - uses: actions/checkout@v7
+        if: ${{ steps.gate.outputs.proceed == 'true' }}
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ env.RESOLVED_PAT }}
+          ref: ${{ inputs.checkout_ref }}
+          persist-credentials: false
+
+      - name: Dispatch e2e batches
+        id: dispatch
+        if: ${{ steps.gate.outputs.proceed == 'true' }}
+        env:
+          # A pooled PAT, not GITHUB_TOKEN: the probe and the dispatch both cross
+          # org boundaries, and events created with GITHUB_TOKEN do not trigger
+          # workflows at all.
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          # The whole pool, so fanout.mjs can move a dispatch refused by GitHub's
+          # per-account secondary rate limit to another account.
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          SELF: ${{ github.repository }}
+          FLEET: ${{ inputs.fleet }}
+          MODE: ${{ needs.e2e-plan.outputs.mode }}
+          PLAN_SHARDS: ${{ needs.e2e-plan.outputs.shards }}
+          PLAN_TOTAL: ${{ needs.e2e-plan.outputs.total }}
+          DESIRED_TOTAL: ${{ inputs.e2e_shards }}
+          TARGETS: ${{ needs.e2e-plan.outputs.targets }}
+          CHECKOUT_REF: ${{ inputs.checkout_ref }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          COORD_RUN_ID: ${{ github.run_id }}
+          # Unique per coordinator run+attempt — this is what a batch's
+          # run-name embeds and what `collect` matches on.
+          CORRELATION: ${{ github.run_id }}-${{ github.run_attempt }}
+          # With no recruitable worker the coordinator dispatches to its OWN
+          # repo rather than running inline, so there is never a local matrix.
+          COORD_FALLBACK_SLOTS: '14'
+          # The per-host CAP, applied on top of what the host actually has free
+          # (fanout counts in-flight JOBS now, so a host running someone else's
+          # batch lends its remainder rather than being skipped). 12 shards plus
+          # the worker's own `plan` job sits at 13 of the org's 20, so one PR
+          # still cannot monopolise a host. Paired with the 48-shard default it
+          # fans out over four workers — for PR CI and the production deploy
+          # gate alike, which scripts/gate/ci/e2e-shards.mjs holds in step.
+          #
+          # It was 8 while the probe was a binary busy check: every host was
+          # either idle or skipped, so 8 was the whole reservation policy. With
+          # real occupancy measured, that reservation is automatic.
+          WORKER_SLOTS: '12'
+        run: |
+          set -euo pipefail
+          if [ ! -f scripts/ci/fanout.mjs ]; then
+            echo "::error::scripts/ci/fanout.mjs is missing on this ref — rebase the PR onto main."
+            exit 1
+          fi
+          node scripts/ci/fanout.mjs dispatch
+
+      - name: Wait for e2e batches
+        id: collect
+        if: ${{ steps.gate.outputs.proceed == 'true' && steps.dispatch.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          FANOUT: ${{ steps.dispatch.outputs.fanout }}
+          TIMEOUT_S: '2400'
+        run: node scripts/ci/fanout.mjs collect
+
+      # Consumed by /watch-ci and /fix-ci (via scripts/ci/ppap/ci-repo.sh
+      # --fanout) to find the shard logs that live in other repos. Uploaded
+      # after collect so it carries the resolved run ids.
+      - name: Upload fan-out map
+        if: ${{ always() && steps.gate.outputs.proceed == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-fanout
+          path: ci-fanout.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Emit e2e verdict
+        id: verdict
+        if: ${{ always() }}
+        env:
+          PROCEED: ${{ steps.gate.outputs.proceed }}
+          GATE_RESULT: ${{ steps.gate.outputs.result }}
+          DISPATCH: ${{ steps.dispatch.outcome }}
+          COLLECT: ${{ steps.collect.outcome }}
+          COLLECT_RESULT: ${{ steps.collect.outputs.result }}
+        run: |
+          set -euo pipefail
+          if [ "$PROCEED" != "true" ]; then
+            RESULT="$GATE_RESULT"
+          elif [ "$DISPATCH" != "success" ]; then
+            # scripts/ci/fanout.mjs throws rather than dispatch a partial set, so a
+            # failed dispatch means an unknown share of the suite never ran.
+            RESULT=failure
+          elif [ "$COLLECT" != "success" ] || [ "$COLLECT_RESULT" != "success" ]; then
+            RESULT=failure
+          else
+            RESULT=success
+          fi
+          echo "result=$RESULT" >> "$GITHUB_OUTPUT"
+          echo "▶ e2e verdict: proceed=$PROCEED dispatch=$DISPATCH collect=$COLLECT/$COLLECT_RESULT → $RESULT" >&2
